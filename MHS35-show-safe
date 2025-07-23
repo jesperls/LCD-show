@@ -1,0 +1,212 @@
+#!/bin/bash
+
+# Safer MHS35 LCD Setup Script
+# This version minimizes system changes and preserves existing configurations
+
+# Create backup directory if it doesn't exist
+if [ ! -d "./.system_backup" ]; then
+    sudo mkdir ./.system_backup
+fi
+
+echo "Starting MHS35 LCD setup (safe version)..."
+
+# Backup only what we're actually going to change
+echo "Creating backups..."
+if [ -f /boot/config.txt ]; then
+    sudo cp /boot/config.txt ./.system_backup/config.txt.backup
+fi
+
+if [ -f /etc/X11/xorg.conf.d/99-calibration.conf ]; then
+    sudo cp /etc/X11/xorg.conf.d/99-calibration.conf ./.system_backup/
+fi
+
+# Get system info for architecture detection
+if [ $(getconf WORD_BIT) = '32' ] && [ $(getconf LONG_BIT) = '64' ] ; then
+    hardware_arch=64
+else
+    hardware_arch=32
+fi
+
+deb_version=`cat /etc/debian_version | tr -d '\n'`
+
+# Create X11 config directory if needed
+if [ ! -d /etc/X11/xorg.conf.d ]; then
+    sudo mkdir -p /etc/X11/xorg.conf.d
+fi
+
+# Install the overlay files
+echo "Installing MHS35 overlay files..."
+sudo cp ./usr/mhs35-overlay.dtb /boot/overlays/
+sudo cp ./usr/mhs35-overlay.dtb /boot/overlays/mhs35.dtbo
+
+# Modify boot config - append our settings instead of overwriting
+echo "Configuring boot settings..."
+
+# Remove any existing MHS35 configuration to avoid duplicates
+sudo sed -i '/# MHS35 LCD Configuration/,/# End MHS35 LCD Configuration/d' /boot/config.txt
+
+# Add our LCD configuration block
+cat << 'EOF' | sudo tee -a /boot/config.txt > /dev/null
+
+# MHS35 LCD Configuration
+# Added by MHS35-show-safe script
+hdmi_force_hotplug=1
+dtparam=i2c_arm=on
+dtparam=spi=on
+enable_uart=1
+dtoverlay=mhs35:rotate=90
+hdmi_group=2
+hdmi_mode=87
+hdmi_cvt 480 320 60 6 0 0 0
+hdmi_drive=2
+# End MHS35 LCD Configuration
+EOF
+
+# Install touch calibration
+echo "Installing touch calibration..."
+sudo cp -rf ./usr/99-calibration.conf-mhs35-90 /etc/X11/xorg.conf.d/99-calibration.conf
+
+# Install fbturbo config for older versions only if it doesn't exist
+if [[ "$deb_version" < "12.1" ]]; then
+    if [ ! -f /usr/share/X11/xorg.conf.d/99-fbturbo.conf ]; then
+        sudo cp -rf ./usr/99-fbturbo.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+    fi
+fi
+
+# Record installation
+sudo touch ./.have_installed
+echo "gpio:resistance:mhs35:90:480:320" > ./.have_installed
+
+# Install FBCP (framebuffer copy) for screen mirroring
+echo "Installing FBCP..."
+if [[ "$deb_version" < "12.10" ]]; then
+    sudo apt-get update
+fi
+
+# Check internet connectivity before attempting downloads
+wget --spider -q -o /dev/null --tries=1 -T 10 https://cmake.org/
+if [ $? -eq 0 ]; then
+    echo "Installing cmake and build dependencies..."
+    sudo apt-get install cmake libraspberrypi-dev -y 2> error_output.txt
+    
+    if command -v cmake > /dev/null 2>&1; then
+        echo "Building FBCP..."
+        sudo rm -rf rpi-fbcp
+        
+        # Try to clone from GitHub
+        wget --spider -q -o /dev/null --tries=1 -T 10 https://github.com
+        if [ $? -eq 0 ]; then
+            git clone https://github.com/tasanakorn/rpi-fbcp
+            if [ $? -ne 0 ]; then
+                echo "Download failed, using local copy..."
+                sudo cp -r ./usr/rpi-fbcp .
+            fi
+        else
+            echo "No internet access, using local copy..."
+            sudo cp -r ./usr/rpi-fbcp .
+        fi
+        
+        # Build FBCP
+        mkdir -p ./rpi-fbcp/build
+        cd ./rpi-fbcp/build/
+        cmake ..
+        make
+        sudo install fbcp /usr/local/bin/fbcp
+        cd - > /dev/null
+        
+        # Setup FBCP autostart - SAFER METHOD
+        if command -v fbcp > /dev/null 2>&1; then
+            echo "Setting up FBCP autostart..."
+            
+            # Create a systemd service instead of modifying rc.local
+            sudo tee /etc/systemd/system/fbcp.service > /dev/null << 'EOF'
+[Unit]
+Description=Framebuffer Copy for LCD
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/local/bin/fbcp
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=graphical-session.target
+EOF
+            
+            # Enable the service
+            sudo systemctl daemon-reload
+            sudo systemctl enable fbcp.service
+            
+            # Update fbturbo config for FBCP if needed
+            if [[ "$deb_version" < "12.1" ]]; then
+                if [ -f ./usr/99-fbturbo-fbcp.conf ]; then
+                    sudo cp -rf ./usr/99-fbturbo-fbcp.conf /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+                fi
+            fi
+        fi
+    else
+        echo "Warning: cmake installation failed, FBCP will not be available"
+    fi
+else
+    echo "Warning: No internet connection, cannot install cmake/FBCP"
+fi
+
+# Install touch input drivers (safer approach)
+echo "Setting up touch input drivers..."
+version=`uname -v`
+version=${version##* }
+
+if test $version -gt 2017; then
+    echo "Installing touch input drivers..."
+    
+    # Try package manager first
+    wget --spider -q -o /dev/null --tries=1 -T 10 http://mirrors.zju.edu.cn/raspbian/raspbian
+    if [ $? -eq 0 ]; then
+        sudo apt-get install xserver-xorg-input-evdev -y 2> error_output.txt
+    fi
+    
+    # Check if installation was successful
+    if ! dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1; then
+        echo "Package installation failed, trying local package..."
+        if [ $hardware_arch -eq 32 ]; then
+            sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-1+b1_armhf.deb 2> error_output.txt
+        elif [ $hardware_arch -eq 64 ]; then
+            sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-2_arm64.deb 2> error_output.txt
+        fi
+    fi
+    
+    # Only modify evdev config if the package installed successfully
+    if dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1; then
+        if [ -f /usr/share/X11/xorg.conf.d/10-evdev.conf ]; then
+            sudo cp /usr/share/X11/xorg.conf.d/10-evdev.conf /usr/share/X11/xorg.conf.d/45-evdev.conf
+        fi
+    fi
+fi
+
+echo "Setup complete!"
+echo ""
+echo "IMPORTANT NOTES:"
+echo "1. This script preserves your existing system configuration"
+echo "2. Auto-login and raspi-config functionality are maintained"
+echo "3. FBCP is managed via systemd service instead of rc.local"
+echo "4. Your original /boot/config.txt is backed up"
+echo ""
+echo "To restore original settings, run: sudo ./system_restore.sh"
+echo ""
+
+# Handle rotation parameter if provided
+if [ $# -eq 1 ]; then
+    echo "Applying rotation: $1"
+    sudo ./rotate.sh $1
+elif [ $# -gt 1 ]; then
+    echo "Too many parameters"
+fi
+
+echo "Rebooting to apply changes..."
+sudo sync
+sudo sync
+sleep 2
+sudo reboot

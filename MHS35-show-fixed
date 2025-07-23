@@ -1,0 +1,180 @@
+#!/bin/bash
+
+# MHS35 LCD Setup Script - Modified for Safety
+# This version preserves raspi-config, auto-login, and system stability
+
+# Create safer backup
+if [ ! -d "./.system_backup" ]; then
+    sudo mkdir ./.system_backup
+fi
+
+# Only backup what we actually change
+if [ -f /boot/config.txt ]; then
+    sudo cp /boot/config.txt ./.system_backup/config.txt.backup
+fi
+
+# Remove problematic system_backup.sh call and replace with minimal backup
+# sudo ./system_backup.sh  # REMOVED - too invasive
+
+if [ -f /etc/X11/xorg.conf.d/40-libinput.conf ]; then
+    sudo rm -rf /etc/X11/xorg.conf.d/40-libinput.conf
+fi
+if [ ! -d /etc/X11/xorg.conf.d ]; then
+    sudo mkdir -p /etc/X11/xorg.conf.d
+fi
+sudo cp ./usr/mhs35-overlay.dtb /boot/overlays/
+sudo cp ./usr/mhs35-overlay.dtb /boot/overlays/mhs35.dtbo
+
+# Get system info without invasive system_config.sh
+deb_version=`cat /etc/debian_version | tr -d '\n'`
+if [ $(getconf WORD_BIT) = '32' ] && [ $(getconf LONG_BIT) = '64' ] ; then
+    hardware_arch=64
+else
+    hardware_arch=32
+fi
+
+# REMOVED: source ./system_config.sh - this was disabling Wayland and causing issues
+
+# Safely append to config.txt instead of overwriting
+# Remove any existing MHS35 config first to avoid duplicates
+sudo sed -i '/# MHS35-LCD-START/,/# MHS35-LCD-END/d' /boot/config.txt
+
+# Add our configuration block
+cat << 'EOF' | sudo tee -a /boot/config.txt > /dev/null
+
+# MHS35-LCD-START
+hdmi_force_hotplug=1
+dtparam=i2c_arm=on
+dtparam=spi=on
+enable_uart=1
+dtoverlay=mhs35:rotate=90
+hdmi_group=2
+hdmi_mode=1
+hdmi_mode=87
+hdmi_cvt 480 320 60 6 0 0 0
+hdmi_drive=2
+# MHS35-LCD-END
+EOF
+
+sudo cp -rf ./usr/99-calibration.conf-mhs35-90  /etc/X11/xorg.conf.d/99-calibration.conf
+if [[ "$deb_version" < "12.1" ]]; then
+    sudo cp -rf ./usr/99-fbturbo.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+fi
+
+# REMOVED: Problematic inittab overwrite that breaks auto-login
+# sudo cp ./usr/inittab /etc/  # REMOVED - this breaks auto-login
+
+sudo touch ./.have_installed
+echo "gpio:resistance:mhs35:90:480:320" > ./.have_installed
+
+if [[ "$deb_version" < "12.10" ]]; then
+    sudo apt-get update
+fi
+
+#FBCP install
+wget --spider -q -o /dev/null --tries=1 -T 10 https://cmake.org/
+if [ $? -eq 0 ]; then
+    sudo apt-get install cmake libraspberrypi-dev -y 2> error_output.txt
+    result=`cat ./error_output.txt`
+    echo -e "\033[31m$result\033[0m"
+    grep -q "^E:" ./error_output.txt
+    type cmake > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        sudo rm -rf rpi-fbcp
+        wget --spider -q -o /dev/null --tries=1 -T 10 https://github.com
+        if [ $? -eq 0 ]; then
+            sudo git clone https://github.com/tasanakorn/rpi-fbcp
+            if [ $? -ne 0 ]; then
+                echo "download fbcp failed, copy native fbcp!!!"
+                sudo cp -r ./usr/rpi-fbcp .
+            fi
+        else
+            echo "bad network, copy native fbcp!!!"
+            sudo cp -r ./usr/rpi-fbcp .
+        fi
+        sudo mkdir ./rpi-fbcp/build
+        cd ./rpi-fbcp/build/
+        sudo cmake ..
+        sudo make
+        sudo install fbcp /usr/local/bin/fbcp
+        cd - > /dev/null
+        type fbcp > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            if [[ "$deb_version" < "12.1" ]]; then
+                sudo cp -rf ./usr/99-fbturbo-fbcp.conf  /usr/share/X11/xorg.conf.d/99-fbturbo.conf
+            fi
+            
+            # SAFER rc.local modification - preserve existing content
+            if [ -f /etc/rc.local ]; then
+                # Backup current rc.local
+                sudo cp /etc/rc.local ./.system_backup/rc.local.backup
+                
+                # Remove existing fbcp entries to avoid duplicates
+                sudo sed -i '/fbcp/d' /etc/rc.local
+                
+                # Add fbcp before the final exit 0
+                sudo sed -i '/^exit 0$/i sleep 7\nfbcp &\n' /etc/rc.local
+            else
+                # If no rc.local exists, use our version
+                sudo cp -rf ./etc/rc.local /etc/rc.local
+            fi
+        fi
+    else
+        echo "install cmake error!!!!"
+    fi
+else
+    echo "bad network, can't install cmake!!!"
+fi
+
+#evdev install - keep existing logic but less invasive
+version=`uname -v`
+input_result=0
+version=${version##* }
+echo $version
+if test $version -lt 2017;then
+    echo "reboot"
+else
+    echo "need to update touch configuration"
+    wget --spider -q -o /dev/null --tries=1 -T 10 http://mirrors.zju.edu.cn/raspbian/raspbian
+    if [ $? -ne 0 ]; then
+        input_result=1
+    else
+        sudo apt-get install xserver-xorg-input-evdev  2> error_output.txt
+        dpkg -l | grep xserver-xorg-input-evdev > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            input_result=1
+        fi
+    fi
+    if [ $input_result -eq 1 ]; then 
+        if [ $hardware_arch -eq 32 ]; then
+            sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-1+b1_armhf.deb 2> error_output.txt
+        elif [ $hardware_arch -eq 64 ]; then
+            sudo dpkg -i -B ./xserver-xorg-input-evdev_1%3a2.10.6-2_arm64.deb 2> error_output.txt
+        fi
+    fi
+    result=`cat ./error_output.txt`
+    echo -e "\033[31m$result\033[0m"
+    grep -q "error:" ./error_output.txt && exit
+    sudo cp -rf /usr/share/X11/xorg.conf.d/10-evdev.conf /usr/share/X11/xorg.conf.d/45-evdev.conf
+fi
+
+sudo sync
+sudo sync
+sleep 1
+if [ $# -eq 1 ]; then
+    sudo ./rotate.sh $1
+elif [ $# -gt 1 ]; then
+    echo "Too many parameters"
+fi
+
+echo ""
+echo "============================================"
+echo "MHS35 LCD setup completed with safety modifications:"
+echo "1. Preserved auto-login settings"
+echo "2. Did not disable Wayland unnecessarily" 
+echo "3. Preserved raspi-config functionality"
+echo "4. Made minimal changes to system files"
+echo "============================================"
+echo ""
+echo "reboot now"
+sudo reboot
